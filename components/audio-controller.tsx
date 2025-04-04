@@ -2,22 +2,26 @@
 
 import { useState, useEffect, useRef } from "react"
 import { Slider } from "@/components/ui/slider"
-import { Input } from "@/components/ui/input"
 import { Button } from "@/components/ui/button"
 import { Card } from "@/components/ui/card"
-import { Play, Pause, Music, Sliders } from "lucide-react"
+import { Play, Pause, Sliders } from "lucide-react"
 import HandGestureController from "./hand-gesture-controller"
 import AudioVisualizer from "./audio-visualizer"
+import DropZone from "./drop-zone"
 
 export default function AudioController() {
-  const [audioUrl, setAudioUrl] = useState("")
+  const [audioFile, setAudioFile] = useState<File | null>(null)
+  const [audioObjectUrl, setAudioObjectUrl] = useState<string | null>(null)
   const [isPlaying, setIsPlaying] = useState(false)
   const [volume, setVolume] = useState(0.5)
   const [speed, setSpeed] = useState(1.0)
   const [pitch, setPitch] = useState(1.0)
+  const [mix, setMix] = useState(100)
   const [isLoaded, setIsLoaded] = useState(false)
   const [showWebcam, setShowWebcam] = useState(false)
   const [gestureControlEnabled, setGestureControlEnabled] = useState(false)
+  const [fileName, setFileName] = useState<string>("")
+  const [analyser, setAnalyser] = useState<AnalyserNode | null>(null);
 
   const audioContextRef = useRef<AudioContext | null>(null)
   const audioElementRef = useRef<HTMLAudioElement | null>(null)
@@ -26,38 +30,40 @@ export default function AudioController() {
   const pitchProcessorRef = useRef<any>(null)
 
   useEffect(() => {
-    // Initialize audio context
+    // Initialize audio context and related nodes
     if (typeof window !== "undefined" && !audioContextRef.current) {
       const AudioContext = window.AudioContext || (window as any).webkitAudioContext
       audioContextRef.current = new AudioContext()
-
-      // Create audio element
+  
       const audioElement = new Audio()
       audioElement.crossOrigin = "anonymous"
       audioElementRef.current = audioElement
-
-      // Create gain node for volume control
+  
       const gainNode = audioContextRef.current.createGain()
       gainNodeRef.current = gainNode
       gainNode.connect(audioContextRef.current.destination)
-
-      // Set up event listeners
+  
       audioElement.addEventListener("ended", () => setIsPlaying(false))
-      audioElement.addEventListener("canplay", () => setIsLoaded(true))
+      audioElement.addEventListener("canplay", () => {
+        console.log("canplay event fired")
+        setIsLoaded(true)
+      })
     }
-
+  
     return () => {
-      // Cleanup
+      // Cleanup audio element
       if (audioElementRef.current) {
         audioElementRef.current.pause()
         audioElementRef.current.src = ""
       }
-
-      if (audioContextRef.current) {
-        audioContextRef.current.close()
+  
+      // Clean up object URL
+      if (audioObjectUrl) {
+        URL.revokeObjectURL(audioObjectUrl)
       }
     }
   }, [])
+  
 
   // Handle volume changes
   useEffect(() => {
@@ -73,42 +79,103 @@ export default function AudioController() {
     }
   }, [speed])
 
-  // Handle pitch changes (simplified - in a real app, you'd use a proper pitch shifter)
   useEffect(() => {
-    if (pitchProcessorRef.current) {
-      // This is a simplified representation - actual pitch shifting is more complex
-      // and would require a proper audio worklet or library
-      pitchProcessorRef.current.pitch = pitch
+    if (pitchProcessorRef.current && audioContextRef.current) {
+      const pitchParam = pitchProcessorRef.current.parameters.get('pitch');
+      pitchParam.setValueAtTime(pitch, audioContextRef.current.currentTime);
     }
   }, [pitch])
-
-  const loadAudio = () => {
-    if (!audioUrl) {
-      alert("Please enter an audio URL")
-      return
+  
+  useEffect(() => {
+    if (pitchProcessorRef.current && audioContextRef.current) {
+      const mixParam = pitchProcessorRef.current.parameters.get('mix');
+      mixParam.setValueAtTime(mix, audioContextRef.current.currentTime);
     }
+  }, [mix]);
 
-    if (!audioElementRef.current || !audioContextRef.current) return
+  // Handle file drop
+  const handleFileDrop = (files: FileList) => {
+    if (files.length > 0) {
+      const file = files[0]
 
+      // Check if it's an audio file
+      if (file.type.startsWith("audio/")) {
+        setAudioFile(file)
+        setFileName(file.name)
+
+        // Clean up previous object URL
+        if (audioObjectUrl) {
+          URL.revokeObjectURL(audioObjectUrl)
+        }
+
+        // Create new object URL
+        const objectUrl = URL.createObjectURL(file)
+        setAudioObjectUrl(objectUrl)
+
+        // Load the audio
+        loadAudio(objectUrl)
+      } else {
+        alert("Please upload an audio file (MP3, WAV, OGG, etc.)")
+      }
+    }
+  }
+
+  const loadAudio = async (audioSrc: string) => {
+    if (!audioSrc || !audioContextRef.current) return;
+  
+    // Ensure the AudioContext is running
+    if (audioContextRef.current.state !== "running") {
+      await audioContextRef.current.resume();
+    }
+  
     // Reset previous connections
     if (sourceNodeRef.current) {
-      sourceNodeRef.current.disconnect()
+      sourceNodeRef.current.disconnect();
     }
-
-    // Set audio source
-    audioElementRef.current.src = audioUrl
-    audioElementRef.current.load()
-
+  
+    try {
+      // Now that the AudioContext is resumed, add the worklet module
+      await audioContextRef.current.audioWorklet.addModule('/pitch-shifter-processor.js');
+    } catch (error) {
+      console.error('Failed to load pitch shifter module', error);
+      return;
+    }
+  
+    // Create the pitch shifter node
+    const pitchShifterNode = new AudioWorkletNode(audioContextRef.current, 'pitch-shifter-processor', {
+      parameterData: { pitch: pitch, mix: mix }
+    });
+    pitchProcessorRef.current = pitchShifterNode;
+    
+    // Set audio source on the existing audio element
+    audioElementRef.current!.src = audioSrc;
+    audioElementRef.current!.load();
+  
     // Create and connect source node
-    sourceNodeRef.current = audioContextRef.current.createMediaElementSource(audioElementRef.current)
+    sourceNodeRef.current = audioContextRef.current.createMediaElementSource(audioElementRef.current!);
+  
+    // Chain: source -> pitch shifter -> gain node -> destination
+    sourceNodeRef.current.connect(gainNodeRef.current!);
+    sourceNodeRef.current.connect(pitchShifterNode);
+    const splitter = audioContextRef.current.createChannelSplitter(2);
+    pitchShifterNode.connect(splitter);
 
-    // For a real app, you would insert a pitch shifter node here
-    // This is simplified - just connecting directly to gain node
-    sourceNodeRef.current.connect(gainNodeRef.current!)
+      // Connect one branch to the gain node (for playback)
+    splitter.connect(gainNodeRef.current!, 0);
 
-    setIsLoaded(true)
-    console.log("Audio loaded successfully")
-  }
+    // Create an analyser node for visualization
+    const analyserNode = audioContextRef.current.createAnalyser();
+    analyserNode.fftSize = 256;
+    // Connect the other branch to the analyser node
+    splitter.connect(analyserNode, 0);
+
+    // Save the analyser node (you can use state or a ref)
+    setAnalyser(analyserNode); 
+
+  
+    setIsLoaded(true);
+    console.log("Audio loaded with pitch shifter");
+  }  
 
   const togglePlayback = () => {
     if (!audioElementRef.current || !isLoaded) return
@@ -152,20 +219,15 @@ export default function AudioController() {
     <div className="flex flex-col gap-8">
       <Card className="p-6 bg-gray-800 border-gray-700">
         <div className="flex flex-col gap-4">
-          <div className="flex flex-col md:flex-row gap-4">
-            <Input
-              type="text"
-              placeholder="Enter audio URL"
-              value={audioUrl}
-              onChange={(e) => setAudioUrl(e.target.value)}
-              className="flex-grow"
-            />
-            <Button onClick={loadAudio} className="whitespace-nowrap">
-              <Music className="mr-2 h-4 w-4" /> Load Audio
-            </Button>
-          </div>
+          <DropZone onFileDrop={handleFileDrop} />
 
-          <div className="flex justify-between items-center">
+          {fileName && (
+            <div className="mt-2 text-sm text-gray-300">
+              <span className="font-medium">Loaded file:</span> {fileName}
+            </div>
+          )}
+
+          <div className="flex justify-between items-center mt-4">
             <Button onClick={togglePlayback} disabled={!isLoaded} variant="outline" size="icon" className="h-12 w-12">
               {isPlaying ? <Pause className="h-6 w-6" /> : <Play className="h-6 w-6" />}
             </Button>
@@ -212,7 +274,7 @@ export default function AudioController() {
                 <Slider
                   value={[speed * 50]}
                   min={25}
-                  max={200}
+                  max={100}
                   step={5}
                   onValueChange={(value) => setSpeed(value[0] / 50)}
                   className="[&>span:first-child]:h-2 [&>span:first-child]:bg-blue-500"
@@ -239,7 +301,7 @@ export default function AudioController() {
             </div>
           </Card>
 
-          {isPlaying && <AudioVisualizer audioElement={audioElementRef.current} />}
+          {isPlaying && <AudioVisualizer analyser={analyser} />}
         </div>
 
         <div className="flex flex-col">
